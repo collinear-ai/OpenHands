@@ -9,15 +9,6 @@ OpenHands can record logprobs in two places:
 2) Embedded inside the eval output.jsonl (EvalOutput), under:
      history[*].tool_call_metadata.model_response.choices[0].logprobs.content
 
-For GRPO-style training you often want a single concatenated stream of:
-  - token_id
-  - logprob (prefer sampling_logprob if present)
-  - (optional) token
-plus a mask (default: all ones).
-
-This script supports both sources:
-  - --llm-completions-dir / --eval-run-dir  (per-call JSONs)
-  - --output-jsonl                          (embedded logprobs in history)
 
 Usage examples:
   # Point directly at an instance directory
