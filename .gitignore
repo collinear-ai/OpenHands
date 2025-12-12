@@ -187,7 +187,7 @@ repomix-output.txt
 
 # Emacs backup
 *~
-
+evaluation_outputs/
 # evaluation
 evaluation/evaluation_outputs
 evaluation/outputs
