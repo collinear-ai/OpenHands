@@ -1,4 +1,4 @@
-[llm.fireworks]
+[llm.fireworks]  # this can be llm.anything
 model = "openai/accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"
 base_url = "https://api.fireworks.ai/inference/v1"
 api_key = ""  # leave empty if you have already set an env variable
