@@ -1,5 +1,6 @@
 import os
 import platform
+import time
 import typing
 from functools import lru_cache
 from typing import Callable
@@ -7,6 +8,7 @@ from uuid import UUID
 
 import docker
 import httpx
+import requests
 import tenacity
 from docker.models.containers import Container
 from docker.types import DriverConfig, Mount
@@ -46,6 +48,8 @@ EXECUTION_SERVER_PORT_RANGE = (30000, 39999)
 VSCODE_PORT_RANGE = (40000, 49999)
 APP_PORT_RANGE_1 = (50000, 54999)
 APP_PORT_RANGE_2 = (55000, 59999)
+
+DEFAULT_DOCKER_CLIENT_TIMEOUT = 600
 
 if os.name == 'nt' or platform.release().endswith('microsoft-standard-WSL2'):
     EXECUTION_SERVER_PORT_RANGE = (30000, 34999)
@@ -128,7 +132,10 @@ class DockerRuntime(ActionExecutionClient):
                 f'http://{os.environ["DOCKER_HOST_ADDR"]}'
             )
 
-        self.docker_client: docker.DockerClient = self._init_docker_client()
+        self._docker_client_timeout = self._get_docker_client_timeout_seconds()
+        self.docker_client: docker.DockerClient = self._init_docker_client(
+            self._docker_client_timeout
+        )
         self.api_url = f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
 
         self.base_container_image = self.config.sandbox.base_container_image
@@ -247,11 +254,37 @@ class DockerRuntime(ActionExecutionClient):
                 enable_browser=self.config.enable_browser,
             )
 
+    def _get_docker_client_timeout_seconds(self) -> int:
+        env_override = os.environ.get('OPENHANDS_DOCKER_CLIENT_TIMEOUT') or os.environ.get(
+            'DOCKER_CLIENT_TIMEOUT'
+        )
+        if env_override:
+            try:
+                parsed = int(env_override)
+                if parsed > 0:
+                    return parsed
+                logger.warning(
+                    'Ignoring non-positive DOCKER_CLIENT_TIMEOUT override value: %s',
+                    env_override,
+                )
+            except ValueError:
+                logger.warning(
+                    'Ignoring invalid DOCKER_CLIENT_TIMEOUT override value: %s',
+                    env_override,
+                )
+
+        config_timeout = getattr(self.config.sandbox, 'docker_client_timeout', None)
+        if config_timeout and config_timeout > 0:
+            return config_timeout
+
+        sandbox_timeout = getattr(self.config.sandbox, 'timeout', None) or 120
+        return max(DEFAULT_DOCKER_CLIENT_TIMEOUT, sandbox_timeout + 60)
+
     @staticmethod
-    @lru_cache(maxsize=1)
-    def _init_docker_client() -> docker.DockerClient:
+    @lru_cache(maxsize=4)
+    def _init_docker_client(timeout_seconds: int) -> docker.DockerClient:
         try:
-            return docker.from_env()
+            return docker.from_env(timeout=timeout_seconds)
         except Exception as ex:
             logger.error(
                 'Launch docker client failed. Please make sure you have installed docker and started docker desktop/daemon.',
@@ -531,8 +564,25 @@ class DockerRuntime(ActionExecutionClient):
                 device_requests=device_requests,
                 **(self.config.sandbox.docker_runtime_kwargs or {}),
             )
-            self.log('debug', f'Container started. Server url: {self.api_url}')
-            self.set_runtime_status(RuntimeStatus.RUNTIME_STARTED)
+        except requests.exceptions.ReadTimeout as timeout_error:
+            self.log(
+                'warning',
+                'Docker client timed out while waiting for the runtime container to report status. '
+                'Will attempt to fetch the container directly; consider increasing sandbox.docker_client_timeout '
+                'or setting OPENHANDS_DOCKER_CLIENT_TIMEOUT if this happens often.',
+            )
+            try:
+                self.container = self.docker_client.containers.get(self.container_name)
+            except docker.errors.NotFound as not_found_error:
+                self.close()
+                raise RuntimeError(
+                    'Docker reported a timeout and the runtime container is missing. '
+                    'Raise sandbox.docker_client_timeout or set OPENHANDS_DOCKER_CLIENT_TIMEOUT to allow slower starts.'
+                ) from not_found_error
+            self.log(
+                'warning',
+                'Recovered container handle after Docker client timeout; continuing startup.',
+            )
         except Exception as e:
             self.log(
                 'error',
@@ -541,10 +591,16 @@ class DockerRuntime(ActionExecutionClient):
             self.close()
             raise e
 
+        if not self.container:
+            raise RuntimeError('Runtime container handle is not available after start attempt.')
+
+        self._ensure_container_running()
+        self.log('debug', f'Container started. Server url: {self.api_url}')
+        self.set_runtime_status(RuntimeStatus.RUNTIME_STARTED)
+
     def _attach_to_container(self) -> None:
         self.container = self.docker_client.containers.get(self.container_name)
-        if self.container.status == 'exited':
-            self.container.start()
+        self._ensure_container_running()
 
         config = self.container.attrs['Config']
         for env_var in config['Env']:
@@ -569,6 +625,63 @@ class DockerRuntime(ActionExecutionClient):
         self.log(
             'debug',
             f'attached to container: {self.container_name} {self._container_port} {self.api_url}',
+        )
+
+    def _ensure_container_running(self) -> None:
+        if not self.container:
+            raise RuntimeError('Container not initialized')
+
+        self.container.reload()
+        status = self.container.status
+        if status in ('running', 'restarting'):
+            return
+
+        if status == 'paused':
+            self.log(
+                'warning', f'Container {self.container_name} is paused; unpausing.'
+            )
+            self.container.unpause()
+        elif status in ('created', 'exited'):
+            self.log(
+                'warning',
+                f'Container {self.container_name} is {status}; attempting to start it now.',
+            )
+            try:
+                self.container.start()
+            except docker.errors.APIError as start_error:
+                message = str(start_error).lower()
+                if 'already started' not in message:
+                    raise
+        elif status == 'dead':
+            raise RuntimeError(
+                f'Container {self.container_name} is dead and cannot be restarted.'
+            )
+        elif status == 'removing':
+            raise RuntimeError(
+                f'Container {self.container_name} is already being removed; please retry the run.'
+            )
+
+        wait_seconds = max(30, min(180, getattr(self.config.sandbox, 'timeout', 120)))
+        deadline = time.time() + wait_seconds
+        last_status = status
+        while time.time() < deadline:
+            self.container.reload()
+            last_status = self.container.status
+            if last_status in ('running', 'restarting'):
+                return
+            if last_status == 'dead':
+                break
+            time.sleep(1)
+
+        try:
+            logs = self.container.logs(tail=80).decode('utf-8', errors='ignore')
+        except Exception:
+            logs = '<unable to retrieve logs>'
+
+        raise RuntimeError(
+            f'Container {self.container_name} failed to reach running state (status: {last_status}). '
+            'Increase sandbox.docker_client_timeout if builds are slow.\n'
+            f'Recent logs (last 80 lines):\n{logs}'
         )
 
     @tenacity.retry(
@@ -744,7 +857,7 @@ class DockerRuntime(ActionExecutionClient):
 
     @classmethod
     async def delete(cls, conversation_id: str) -> None:
-        docker_client = cls._init_docker_client()
+        docker_client = cls._init_docker_client(DEFAULT_DOCKER_CLIENT_TIMEOUT)
         try:
             container_name = CONTAINER_NAME_PREFIX + conversation_id
             container = docker_client.containers.get(container_name)

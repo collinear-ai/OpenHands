@@ -88,6 +88,8 @@ def set_dataset_type(dataset_name: str) -> str:
         DATASET_TYPE = 'SWE-rebench'
     elif 'multimodal' in name_lower:
         DATASET_TYPE = 'Multimodal'
+    elif 'smith' in name_lower:
+        DATASET_TYPE = 'SWE-Smith'
     else:
         DATASET_TYPE = 'SWE-bench'
 
@@ -178,6 +180,7 @@ logger.info(f'Default docker image prefix: {DEFAULT_DOCKER_IMAGE_PREFIX}')
 def get_instance_docker_image(
     instance_id: str,
     swebench_official_image: bool = False,
+    instance: pd.Series | None = None,
 ) -> str:
     if swebench_official_image:
         # Official SWE-Bench image
@@ -189,6 +192,9 @@ def get_instance_docker_image(
             docker_image_prefix = 'docker.io/swebench/'
         elif DATASET_TYPE == 'SWE-rebench':
             docker_image_prefix = 'docker.io/swerebench/'
+        elif DATASET_TYPE == 'SWE-Smith':
+            logger.info(f'Using custom image for SWE-Smith instance: {instance}')
+            return instance['image_name']
         repo, name = instance_id.split('__')
         image_name = f'{docker_image_prefix.rstrip("/")}/sweb.eval.x86_64.{repo}_1776_{name}:latest'.lower()
         logger.debug(f'Using official SWE-Bench image: {image_name}')
@@ -213,6 +219,7 @@ def get_config(
     base_container_image = get_instance_docker_image(
         instance['instance_id'],
         swebench_official_image=use_swebench_official_image,
+        instance=instance
     )
     logger.info(
         f'Using instance container image: {base_container_image}. '
